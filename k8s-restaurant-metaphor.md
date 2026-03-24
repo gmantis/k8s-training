@@ -21,8 +21,11 @@
 10. [Jobs and CronJobs](#10-jobs-and-cronjobs)
 11. [Resource Limits and Requests](#11-resource-limits-and-requests)
 12. [Health Checks (Probes)](#12-health-checks-probes)
-13. [Putting It All Together](#13-putting-it-all-together)
-14. [Quick Reference](#14-quick-reference)
+13. [StatefulSets](#13-statefulsets)
+14. [DaemonSets](#14-daemonsets)
+15. [Ingress](#15-ingress)
+16. [Putting It All Together](#16-putting-it-all-together)
+17. [Quick Reference](#17-quick-reference)
 
 ---
 
@@ -1545,7 +1548,538 @@ kubectl delete service readiness-svc
 
 ---
 
-## 13. Putting It All Together
+## 13. StatefulSets
+
+### The Restaurant Analogy
+
+Imagine a kitchen with named, permanent stations — **Grill Station #1**, **Grill Station #2**, **Grill Station #3**. Unlike interchangeable line cooks who can swap seats, each of these stations has its own identity:
+
+- Station #1 has always been next to the pass-through window — that never changes
+- Station #1 has its own dedicated refrigerator drawer, pre-stocked specifically for its recipes
+- When you close down for the night, you shut down stations in reverse order (#3, #2, #1). When you open up, you bring them online in order (#1, #2, #3)
+
+If Station #2 burns down and needs to be rebuilt, it always comes back as **Station #2** in the same spot — not some random new station.
+
+A **Deployment** would give you three identical, interchangeable cooking slots with no fixed names — any slot can replace any other. A **StatefulSet** gives you *named, ordered, individually-persistent* stations where the identity of each slot matters.
+
+### Technical Concept
+
+A **StatefulSet** is like a Deployment, but for applications that require:
+- **Stable, sticky network identity**: pods are named `<name>-0`, `<name>-1`, `<name>-2` — always. They keep the same DNS name even after restart.
+- **Stable storage**: each pod gets its own PVC (via `volumeClaimTemplates`). Pod-0's disk is always Pod-0's disk — it never gets reassigned.
+- **Ordered startup and shutdown**: pods start in order (0, 1, 2) and shut down in reverse (2, 1, 0). This is critical for databases that elect a primary.
+
+```
+StatefulSet: my-db
+  ├── my-db-0   (PVC: data-my-db-0)   <- starts first, usually the primary
+  ├── my-db-1   (PVC: data-my-db-1)   <- starts after 0 is Ready
+  └── my-db-2   (PVC: data-my-db-2)   <- starts after 1 is Ready
+```
+
+If `my-db-1` is deleted, K8s recreates a pod also named `my-db-1` and reattaches it to the same PVC `data-my-db-1`. The identity is preserved.
+
+**When to use StatefulSet vs Deployment:**
+
+| | Deployment | StatefulSet |
+|---|---|---|
+| Pod names | Random suffixes (`web-7d9f4-xyz`) | Ordered integers (`db-0`, `db-1`) |
+| Pod identity | Interchangeable | Each pod is unique |
+| Storage | Shared PVC (or none) | One PVC per pod (via volumeClaimTemplates) |
+| Startup order | Parallel | Sequential (0, 1, 2) |
+| Use case | Stateless web servers, APIs | Databases, message queues, Zookeeper |
+
+### StatefulSet YAML
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: "postgres"        # Must match a headless Service (see below)
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_PASSWORD
+          value: "example"
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+  volumeClaimTemplates:          # One PVC is created per pod automatically
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard-rwo
+      resources:
+        requests:
+          storage: 5Gi
+---
+# Headless Service — required for stable DNS per pod
+# Unlike a normal Service, this does NOT load-balance; it just provides DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  clusterIP: None              # This is what makes it "headless"
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+```
+
+With a headless Service, each pod gets its own DNS entry:
+```
+postgres-0.postgres.<namespace>.svc.cluster.local
+postgres-1.postgres.<namespace>.svc.cluster.local
+postgres-2.postgres.<namespace>.svc.cluster.local
+```
+
+This allows other applications (or the pods themselves) to reach a specific replica by name — essential for database replication setup.
+
+### Exercise 13.1 — Deploy a StatefulSet
+
+```bash
+# Apply the StatefulSet and headless Service
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-sts-svc
+spec:
+  clusterIP: None
+  selector:
+    app: nginx-sts
+  ports:
+  - port: 80
+    targetPort: 80
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nginx-sts
+spec:
+  serviceName: "nginx-sts-svc"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx-sts
+  template:
+    metadata:
+      labels:
+        app: nginx-sts
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: www
+          mountPath: /usr/share/nginx/html
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+  volumeClaimTemplates:
+  - metadata:
+      name: www
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard-rwo
+      resources:
+        requests:
+          storage: 1Gi
+EOF
+
+# Watch pods come up — note they start in order: 0, then 1, then 2
+kubectl get pods -w -l app=nginx-sts
+
+# Observe stable names
+kubectl get pods -l app=nginx-sts
+
+# Each pod has its own PVC
+kubectl get pvc
+
+# Delete a pod — it comes back with the same name and same PVC
+kubectl delete pod nginx-sts-1
+kubectl get pods -l app=nginx-sts -w
+
+# Confirm PVC is reattached (still www-nginx-sts-1)
+kubectl get pvc
+
+# Check DNS — run a temporary pod and resolve each replica by name
+kubectl run dns-test --image=busybox --rm -it --restart=Never -- \
+  nslookup nginx-sts-0.nginx-sts-svc
+
+# Scale the StatefulSet
+kubectl scale statefulset nginx-sts --replicas=5
+kubectl get pods -l app=nginx-sts -w
+
+# Clean up
+kubectl delete statefulset nginx-sts
+kubectl delete service nginx-sts-svc
+kubectl delete pvc -l app=nginx-sts    # PVCs are NOT deleted automatically
+```
+
+**Key insight:** When you delete a StatefulSet, its PVCs are intentionally left behind to protect data. You must delete them manually.
+
+---
+
+## 14. DaemonSets
+
+### The Restaurant Analogy
+
+The health & safety authority requires a **certified inspector** to be present at every single kitchen station at all times. No exceptions:
+
+- When a new kitchen station opens, an inspector is automatically assigned to it
+- When a station closes, the inspector assigned there leaves too
+- You can never have two inspectors at the same station — exactly one per station, always
+
+These inspectors don't cook. They run alongside every station and perform a specific supporting function — logging incidents, checking temperatures, enforcing hygiene. You didn't ask them to be there; they must be there by rule, everywhere.
+
+This is different from "keep 3 chefs on grill" (Deployment) — it's "keep exactly one inspector at *every* station, however many stations exist."
+
+### Technical Concept
+
+A **DaemonSet** ensures that exactly one copy of a Pod runs on every node (or a subset of nodes matching a node selector). As nodes are added to the cluster, pods are added automatically. As nodes are removed, those pods are garbage collected.
+
+```
+Cluster: 4 nodes
+DaemonSet: fluentbit-logger
+
+  Node 1:  [fluentbit pod]   [app pods...]
+  Node 2:  [fluentbit pod]   [app pods...]
+  Node 3:  [fluentbit pod]   [app pods...]
+  Node 4:  [fluentbit pod]   [app pods...]
+```
+
+**Common DaemonSet use cases:**
+
+| Use case | Example |
+|---|---|
+| Log collection | Fluent Bit, Fluentd — collect logs from each node's container runtime |
+| Metrics / monitoring | Prometheus node-exporter, Datadog agent — scrape node-level metrics |
+| Node-level networking | Calico, Weave Net — CNI plugins that wire up pod networking |
+| Storage drivers | Ceph, GlusterFS volume plugins |
+| Security agents | Falco, Aqua — scan every node for threats |
+
+On `icsg-cluster`, DaemonSets are already running system components. You can see them:
+```bash
+kubectl get daemonsets -n kube-system
+```
+
+### DaemonSet YAML
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-logger
+  labels:
+    app: node-logger
+spec:
+  selector:
+    matchLabels:
+      app: node-logger
+  template:
+    metadata:
+      labels:
+        app: node-logger
+    spec:
+      tolerations:
+      # Allow this DaemonSet to run on control-plane nodes too (optional)
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: logger
+        image: busybox
+        command: ["sh", "-c", "while true; do echo Node $(NODE_NAME): $(date); sleep 10; done"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName   # Injects the node's name as an env var
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "10m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+```
+
+**Key difference from Deployment:** there is no `replicas` field. The number of pods is always equal to the number of nodes (that match the selector).
+
+### Exercise 14.1 — Deploy and observe a DaemonSet
+
+```bash
+# Create a simple DaemonSet that logs its node name
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-logger
+spec:
+  selector:
+    matchLabels:
+      app: node-logger
+  template:
+    metadata:
+      labels:
+        app: node-logger
+    spec:
+      containers:
+      - name: logger
+        image: busybox
+        command: ["sh", "-c", "while true; do echo Running on $(NODE_NAME) at $(date); sleep 15; done"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "10m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+EOF
+
+# Check how many pods were created — should be one per node
+kubectl get daemonset node-logger
+kubectl get pods -l app=node-logger -o wide    # -o wide shows which node each pod landed on
+
+# Confirm one pod per node
+kubectl get pods -l app=node-logger -o wide | awk '{print $7}' | sort | uniq -c
+
+# Check logs from one pod
+kubectl logs -l app=node-logger --prefix=true | head -20
+
+# Observe the NODE_NAME env var is set correctly
+kubectl exec -it $(kubectl get pod -l app=node-logger -o name | head -1) -- env | grep NODE_NAME
+
+# Look at system DaemonSets for comparison
+kubectl get daemonsets -n kube-system
+
+# Clean up
+kubectl delete daemonset node-logger
+```
+
+---
+
+## 15. Ingress
+
+### The Restaurant Analogy
+
+Your restaurant has grown. You now have:
+- A **fine dining section** serving pasta
+- A **bar section** serving drinks
+- A **takeaway counter** for quick orders
+
+Rather than giving customers three separate front doors — three separate addresses — you hire a **front-of-house host**. There's one entrance. The host greets every customer and directs them:
+
+> "Reservation for the fine dining room? Down the hall to `/pasta`."
+> "Just here for drinks? The `/bar` is to your right."
+> "Quick pickup? The `/takeaway` counter is straight ahead."
+
+The host doesn't cook. They don't serve. They read the request — where the customer is going — and route them to the right section. One front door, many destinations.
+
+This is **Ingress**: a single external IP and port 80/443, with routing rules that direct HTTP requests to the correct internal Service based on the URL path or hostname.
+
+Without Ingress: each Service needs its own LoadBalancer → multiple external IPs, multiple GCP load balancers, extra cost.
+
+With Ingress: one LoadBalancer (the Ingress controller), many Services behind it, all sharing one external IP.
+
+```
+                              ┌─────────────────────────┐
+HTTP request                  │      Ingress Resource    │
+  GET /api/users   ──────────►│  /api  → api-service     │──► api-service (ClusterIP)
+  GET /web/home    ──────────►│  /web  → web-service     │──► web-service (ClusterIP)
+  (one external IP)           └─────────────────────────┘
+                                    Ingress Controller
+                                  (nginx pod on the cluster)
+```
+
+### Technical Concept
+
+There are two Ingress-related components:
+
+| Component | What it is |
+|---|---|
+| **Ingress resource** | The YAML object you create. Declares routing rules: "path X goes to service Y". |
+| **Ingress controller** | A running pod (usually nginx or GKE's own controller) that reads Ingress resources and actually handles the traffic routing. You must have one installed. |
+
+Ingress sits in front of ClusterIP Services. The typical stack is:
+
+```
+Internet → Ingress Controller (LoadBalancer Service, one external IP)
+                → Ingress routing rules
+                    → ClusterIP Service A → Pod(s)
+                    → ClusterIP Service B → Pod(s)
+```
+
+**Routing can be by:**
+- **Path**: `example.com/api` → api-service, `example.com/web` → web-service
+- **Hostname**: `api.example.com` → api-service, `web.example.com` → web-service
+- Both combined
+
+On `icsg-cluster`, an nginx Ingress controller is already running. Find its external IP:
+```bash
+kubectl get svc -n ingress-nginx    # or whichever namespace the controller is in
+```
+
+### Ingress YAML
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /   # Strip the path prefix before forwarding
+spec:
+  ingressClassName: nginx                            # Which Ingress controller handles this
+  rules:
+  - http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service      # Must be a Service in the same namespace
+            port:
+              number: 80
+      - path: /web
+        pathType: Prefix
+        backend:
+          service:
+            name: web-service
+            port:
+              number: 80
+```
+
+**Path types:**
+- `Prefix`: matches any path starting with `/api` (e.g. `/api`, `/api/users`, `/api/v2/orders`)
+- `Exact`: matches only `/api` exactly — nothing below it
+
+**Hostname-based routing** (multiple virtual hosts on one IP):
+```yaml
+spec:
+  rules:
+  - host: api.myapp.com        # Only requests with this Host header
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+  - host: web.myapp.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-service
+            port:
+              number: 80
+```
+
+Note: on `icsg-cluster` DNS is not configured. Use path-based routing with the raw Ingress controller IP rather than hostname-based routing.
+
+### Exercise 15.1 — Deploy two services behind one Ingress
+
+```bash
+# Step 1: Deploy two backend apps (each is just nginx serving its default page)
+kubectl create deployment app-a --image=nginx:1.25 --replicas=2
+kubectl create deployment app-b --image=nginx:1.25 --replicas=2
+
+# Expose both as ClusterIP (internal only — Ingress will front them)
+kubectl expose deployment app-a --port=80 --target-port=80 --name=service-a
+kubectl expose deployment app-b --port=80 --target-port=80 --name=service-b
+
+# Step 2: Find the Ingress controller's external IP
+kubectl get svc -A | grep -i ingress
+
+# Step 3: Create an Ingress resource with two path rules
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /a
+        pathType: Prefix
+        backend:
+          service:
+            name: service-a
+            port:
+              number: 80
+      - path: /b
+        pathType: Prefix
+        backend:
+          service:
+            name: service-b
+            port:
+              number: 80
+EOF
+
+# Check the Ingress was created and has an address
+kubectl get ingress demo-ingress
+
+# Once ADDRESS is populated, test both paths:
+# Replace <INGRESS-IP> with the address shown
+curl http://<INGRESS-IP>/a    # Should return nginx default page (routed to service-a)
+curl http://<INGRESS-IP>/b    # Should return nginx default page (routed to service-b)
+
+# Inspect what the Ingress knows about
+kubectl describe ingress demo-ingress
+
+# Clean up
+kubectl delete ingress demo-ingress
+kubectl delete service service-a service-b
+kubectl delete deployment app-a app-b
+```
+
+---
+
+## 16. Putting It All Together
 
 ### The Full Restaurant Loop
 
@@ -1691,7 +2225,7 @@ kubectl delete namespace fullstack-demo
 
 ---
 
-## 14. Quick Reference
+## 17. Quick Reference
 
 ### One-Page Analogy Summary
 
@@ -1728,6 +2262,9 @@ Station burner/counter budget       Resource Requests & Limits
 "Is this station still working?"    Liveness Probe
 Train new chefs while serving       Rolling Update
 Bring back old chefs (bad recipe)   Rollback
+Named, ordered permanent stations   StatefulSet
+Inspector assigned to every station DaemonSet
+Front-of-house host directing guests Ingress
 ```
 
 ### Most-used kubectl Commands
@@ -1785,6 +2322,9 @@ kubectl top nodes
 | `persistentvolumeclaims` | `pvc` |
 | `persistentvolumes` | `pv` |
 | `nodes` | `no` |
+| `statefulsets` | `sts` |
+| `daemonsets` | `ds` |
+| `ingresses` | `ing` |
 
 ```bash
 # Short names work everywhere
@@ -1815,9 +2355,7 @@ Use `--dry-run=client -o yaml` to generate YAML templates instead of typing from
 Once comfortable with these basics, explore:
 
 - **Helm**: Package manager for Kubernetes. Bundles multiple K8s objects into reusable "charts".
-- **Ingress**: Route external HTTP traffic to multiple services by path/hostname (vs one LoadBalancer per service).
-- **StatefulSets**: Like Deployments but for stateful apps (databases). Pods get stable names and dedicated storage.
-- **DaemonSets**: Run exactly one pod per node. Used for log collectors, monitoring agents.
 - **RBAC**: Role-Based Access Control — who can do what in the cluster.
 - **HPA**: Horizontal Pod Autoscaler — automatically scale replicas based on CPU/memory.
 - **NetworkPolicies**: Firewall rules between pods.
+- **TLS with Ingress**: Add HTTPS termination to your Ingress using cert-manager and Let's Encrypt.
